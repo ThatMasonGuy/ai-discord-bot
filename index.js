@@ -3,6 +3,7 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const { Client, Events, GatewayIntentBits } = require('discord.js');
 const OpenAI = require('openai');
+const { prepareVisionAttachments, VisionInputError } = require('./vision');
 
 const client = new Client({
   intents: [
@@ -170,11 +171,12 @@ function hasEveryoneOrHere(message) {
   return byMentions || byText;
 }
 
-async function buildHistory(channel, botUserId) {
+async function buildHistory(channel, botUserId, triggerMessageId, visionImages = []) {
   const fetched = await channel.messages.fetch({ limit: HISTORY_LIMIT });
   const sorted = [...fetched.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
 
   const history = [];
+  const visionAttachmentIds = new Set(visionImages.map(image => image.attachmentId));
 
   for (const m of sorted) {
     const isOurBot = m.author?.id === botUserId;
@@ -189,17 +191,29 @@ async function buildHistory(channel, botUserId) {
     }
 
     if (m.attachments?.size) {
-      const files = [...m.attachments.values()].map(a => a.url).join('\n');
-      content += `\n[attachments]\n${files}`;
+      const files = [...m.attachments.values()]
+        .filter(attachment => (
+          m.id !== triggerMessageId || !visionAttachmentIds.has(attachment.id)
+        ))
+        .map(attachment => attachment.url);
+      if (files.length > 0) content += `\n[attachments]\n${files.join('\n')}`;
     }
 
     // Add username prefix so AI knows who's talking
     const username = m.author?.displayName || m.author?.username || 'Unknown';
-    const prefixedContent = isOurBot ? content : `[${username}]: ${content}`;
+    const prefixedContent = isOurBot
+      ? content
+      : `[${username}]: ${content || '[attached image]'}`;
+    const isVisionMessage = m.id === triggerMessageId && visionImages.length > 0 && !isOurBot;
 
     history.push({
       role: isOurBot ? 'assistant' : 'user',
-      content: prefixedContent,
+      content: isVisionMessage
+        ? [
+            { type: 'input_text', text: prefixedContent },
+            ...visionImages.map(image => image.input),
+          ]
+        : prefixedContent,
     });
   }
 
@@ -436,45 +450,59 @@ client.on('messageCreate', async (message) => {
 
     await message.channel.sendTyping();
 
-    const history = await buildHistory(message.channel, client.user.id);
+    const vision = await prepareVisionAttachments(message.attachments);
 
-    const system = { role: 'system', content: RAT_BOT_SYSTEM_PROMPT };
+    try {
+      const history = await buildHistory(
+        message.channel,
+        client.user.id,
+        message.id,
+        vision.images,
+      );
 
-    // In messageCreate handler, after building history:
-    const triggerUsername = message.author?.displayName || message.author?.username || 'Unknown';
-    
-    const response = await openai.responses.create({
-      ...gpt54MiniOptions(MAX_OUTPUT_TOKENS),
-      input: [
-        system,
-        ...history,
-        {
-          role: 'developer',
-          content: `
+      const system = { role: 'system', content: RAT_BOT_SYSTEM_PROMPT };
+
+      // In messageCreate handler, after building history:
+      const triggerUsername = message.author?.displayName || message.author?.username || 'Unknown';
+
+      const response = await openai.responses.create({
+        ...gpt54MiniOptions(MAX_OUTPUT_TOKENS),
+        input: [
+          system,
+          ...history,
+          {
+            role: 'developer',
+            content: `
 The current speaker is ${triggerUsername}. Reply only to their most recent message.
 Do not answer an older speaker. Keep it natural and in character as Rat Bot.
+If their message includes images, inspect those images and answer what they asked about them.
           `.trim(),
-        },
-      ],
-    });
-
-    const text = neutralizeMassMentions(response.output_text || '').trim() || '(no output)';
-    const chunks = text.match(/[\s\S]{1,1900}/g) || ['(empty)'];
-
-    for (const chunk of chunks) {
-      await message.reply({
-        content: chunk,
-        allowedMentions: {
-          parse: ['users'], // allow user mentions only (no roles, no everyone/here)
-          repliedUser: false,
-        },
+          },
+        ],
       });
+
+      const text = neutralizeMassMentions(response.output_text || '').trim() || '(no output)';
+      const chunks = text.match(/[\s\S]{1,1900}/g) || ['(empty)'];
+
+      for (const chunk of chunks) {
+        await message.reply({
+          content: chunk,
+          allowedMentions: {
+            parse: ['users'], // allow user mentions only (no roles, no everyone/here)
+            repliedUser: false,
+          },
+        });
+      }
+    } finally {
+      await vision.cleanup();
     }
   } catch (err) {
     console.error(err);
     try {
       await message.reply({
-        content: "I crashed 😭 Check the logs.",
+        content: err instanceof VisionInputError
+          ? err.message
+          : "I crashed 😭 Check the logs.",
         allowedMentions: { parse: ['users'], repliedUser: false },
       });
     } catch (_) {}
